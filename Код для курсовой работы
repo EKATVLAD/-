@@ -1,0 +1,402 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from scipy.interpolate import CubicSpline
+from sklearn.model_selection import train_test_split
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set random seeds for reproducibility
+np.random.seed(42)
+torch.manual_seed(42)
+
+class RidgeFunctionApproximator:
+    def __init__(self, m, spline_nodes=10):
+        self.m = m
+        self.spline_nodes = spline_nodes
+        self.directions = None
+        self.splines = None
+        
+    def fit(self, X, y, epochs=1000, lr=0.01):
+        n_samples, n_features = X.shape
+        
+        # Initialize random directions
+        self.directions = torch.randn(self.m, n_features, requires_grad=True)
+        
+        # Initialize spline parameters for each direction
+        self.spline_params = torch.randn(self.m, self.spline_nodes, requires_grad=True)
+        self.spline_knots = torch.linspace(-1.5, 1.5, self.spline_nodes)
+        
+        optimizer = optim.Adam([self.directions, self.spline_params], lr=lr)
+        
+        X_tensor = torch.tensor(X, dtype=torch.float32)
+        y_tensor = torch.tensor(y, dtype=torch.float32)
+        
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            
+            # Normalize directions
+            directions_norm = self.directions / torch.norm(self.directions, dim=1, keepdim=True)
+            
+            # Project data onto directions
+            projections = torch.matmul(X_tensor, directions_norm.T)  # shape: (n_samples, m)
+            
+            # Apply spline transformations
+            outputs = []
+            for j in range(self.m):
+                proj = projections[:, j]
+                # Simple spline-like transformation using the parameters
+                # This is a simplified version - in practice you'd use proper spline interpolation
+                knots = self.spline_knots
+                params = self.spline_params[j]
+                
+                # Linear interpolation between knot parameters
+                indices = torch.searchsorted(knots, proj)
+                indices = torch.clamp(indices, 1, len(knots)-1)
+                
+                t = (proj - knots[indices-1]) / (knots[indices] - knots[indices-1] + 1e-8)
+                spline_output = (1-t) * params[indices-1] + t * params[indices]
+                outputs.append(spline_output)
+            
+            output = torch.stack(outputs, dim=1).sum(dim=1)
+            
+            loss = torch.mean((output - y_tensor) ** 2)
+            loss.backward()
+            optimizer.step()
+            
+            if epoch % 200 == 0:
+                print(f'Ridge Epoch {epoch}, Loss: {loss.item():.6f}')
+    
+    def predict(self, X):
+        with torch.no_grad():
+            X_tensor = torch.tensor(X, dtype=torch.float32)
+            directions_norm = self.directions / torch.norm(self.directions, dim=1, keepdim=True)
+            
+            projections = torch.matmul(X_tensor, directions_norm.T)
+            
+            outputs = []
+            for j in range(self.m):
+                proj = projections[:, j]
+                knots = self.spline_knots
+                params = self.spline_params[j]
+                
+                indices = torch.searchsorted(knots, proj)
+                indices = torch.clamp(indices, 1, len(knots)-1)
+                
+                t = (proj - knots[indices-1]) / (knots[indices] - knots[indices-1] + 1e-8)
+                spline_output = (1-t) * params[indices-1] + t * params[indices]
+                outputs.append(spline_output)
+            
+            return torch.stack(outputs, dim=1).sum(dim=1).numpy()
+
+class MLPApproximator(nn.Module):
+    def __init__(self, input_dim, hidden_units):
+        super(MLPApproximator, self).__init__()
+        self.hidden = nn.Linear(input_dim, hidden_units)
+        self.output = nn.Linear(hidden_units, 1)
+        self.activation = nn.ReLU()
+        
+    def forward(self, x):
+        x = self.activation(self.hidden(x))
+        return self.output(x)
+
+def train_mlp(X, y, hidden_units, epochs=1000, lr=0.01):
+    model = MLPApproximator(X.shape[1], hidden_units)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+    
+    X_tensor = torch.tensor(X, dtype=torch.float32)
+    y_tensor = torch.tensor(y, dtype=torch.float32).unsqueeze(1)
+    
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        outputs = model(X_tensor)
+        loss = criterion(outputs, y_tensor)
+        loss.backward()
+        optimizer.step()
+        
+        if epoch % 200 == 0:
+            print(f'MLP Epoch {epoch}, Loss: {loss.item():.6f}')
+    
+    return model
+
+def enhanced_evaluate_model(model, X_test, y_test, X_grid, y_grid, is_mlp=True, tau_values=[0.05, 0.1]):
+    X_tensor = torch.tensor(X_test, dtype=torch.float32)
+    X_grid_tensor = torch.tensor(X_grid, dtype=torch.float32)
+    
+    if is_mlp:
+        with torch.no_grad():
+            predictions_test = model(X_tensor).squeeze().numpy()
+            predictions_grid = model(X_grid_tensor).squeeze().numpy()
+    else:
+        predictions_test = model.predict(X_test)
+        predictions_grid = model.predict(X_grid)
+    
+    # L2 error on test set
+    l2_error_test = np.sqrt(np.mean((predictions_test - y_test) ** 2))
+    
+    # Uniform error on grid
+    uniform_error_grid = np.max(np.abs(predictions_grid - y_grid))
+    
+    # Fraction of points with error > tau for different tau values
+    large_error_fractions = {}
+    for tau in tau_values:
+        large_error_fractions[tau] = np.mean(np.abs(predictions_test - y_test) > tau)
+    
+    return l2_error_test, uniform_error_grid, large_error_fractions, predictions_test, predictions_grid
+
+# Test functions
+def smooth_wave(x, y):
+    return np.sin(2 * np.pi * x) * np.cos(2 * np.pi * y) + 0.5 * np.sin(4 * np.pi * x * y)
+
+def edge_function(x, y):
+    return np.abs(x - 0.5) + np.abs(y - 0.5) - np.minimum(np.abs(x - 0.3) + np.abs(y - 0.7), 0.4)
+
+def localized_peak(x, y):
+    peak1 = np.exp(-50 * ((x - 0.7)**2 + (y - 0.3)**2))
+    peak2 = 0.5 * np.exp(-80 * ((x - 0.3)**2 + (y - 0.8)**2))
+    return peak1 + peak2
+
+def step_function(x, y):
+    """Бинарная ступенчатая функция 1{x > y}"""
+    return (x > y).astype(float)
+
+# Generate uniform training data in [0,1]^2
+def generate_uniform_training_data(N=4096):
+    """Генерирует равномерную обучающую выборку в [0,1]^2"""
+    # Для получения равномерного распределения используем равномерную сетку
+    n_per_axis = int(np.sqrt(N))
+    x = np.linspace(0, 1, n_per_axis)
+    y = np.linspace(0, 1, n_per_axis)
+    X, Y = np.meshgrid(x, y)
+    points = np.column_stack([X.ravel(), Y.ravel()])
+    
+    # Если нужно точно N точек, можем случайно выбрать подмножество
+    if len(points) > N:
+        indices = np.random.choice(len(points), N, replace=False)
+        points = points[indices]
+    elif len(points) < N:
+        # Добираем случайными точками до нужного количества
+        additional_points = np.random.rand(N - len(points), 2)
+        points = np.vstack([points, additional_points])
+    
+    return points
+
+# Generate 256x256 test grid
+def create_test_grid_256x256():
+    """Создает тестовую сетку 256×256 точек"""
+    x = np.linspace(0, 1, 256)
+    y = np.linspace(0, 1, 256)
+    X, Y = np.meshgrid(x, y)
+    points = np.column_stack([X.ravel(), Y.ravel()])
+    return points, X, Y
+
+# Main experiment with uniform training data and 256x256 test grid
+def run_uniform_experiment(n_seeds=3, tau_values=[0.05, 0.1]):
+    # Уменьшаем количество сидов для скорости, т.к. данные больше
+    seeds = [42, 123, 456][:n_seeds]
+    
+    m_values = [4, 8, 16, 32, 64]
+    
+    functions = {
+        'Smooth Wave': smooth_wave,
+        'Edge Function': edge_function, 
+        'Localized Peak': localized_peak,
+        'Step Function': step_function
+    }
+    
+    results = {}
+    
+    # Создаем тестовую сетку один раз для всех функций и сидов
+    test_grid_points, X_grid, Y_grid = create_test_grid_256x256()
+    print(f"Created test grid with {len(test_grid_points)} points (256x256)")
+    
+    for func_name, func in functions.items():
+        print(f"\n=== Testing {func_name} ===")
+        
+        # Результаты для всех сидов и m
+        all_ridge_results = {m: {'l2': [], 'uniform': [], 'large_error_005': [], 'large_error_01': []} for m in m_values}
+        all_mlp_results = {m: {'l2': [], 'uniform': [], 'large_error_005': [], 'large_error_01': []} for m in m_values}
+        
+        for seed_idx, seed in enumerate(seeds):
+            print(f"\n--- Seed {seed} ({seed_idx + 1}/{len(seeds)}) ---")
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            
+            # Генерируем РАВНОМЕРНУЮ обучающую выборку
+            train_points = generate_uniform_training_data(4096)
+            print(f"Generated uniform training data with {len(train_points)} points")
+            
+            # Вычисляем значения функций
+            y_train = func(train_points[:, 0], train_points[:, 1])
+            y_test_grid = func(test_grid_points[:, 0], test_grid_points[:, 1])
+            
+            for m in m_values:
+                print(f"Testing with m = {m}")
+                
+                # Ridge functions
+                ridge_model = RidgeFunctionApproximator(m)
+                ridge_model.fit(train_points, y_train, epochs=400, lr=0.01)  # Уменьшаем эпохи для скорости
+                ridge_l2, ridge_uni, ridge_large_err, _, _ = enhanced_evaluate_model(
+                    ridge_model, test_grid_points, y_test_grid, test_grid_points, y_test_grid, 
+                    is_mlp=False, tau_values=tau_values
+                )
+                
+                all_ridge_results[m]['l2'].append(ridge_l2)
+                all_ridge_results[m]['uniform'].append(ridge_uni)
+                all_ridge_results[m]['large_error_005'].append(ridge_large_err[0.05])
+                all_ridge_results[m]['large_error_01'].append(ridge_large_err[0.1])
+                
+                # MLP
+                mlp_model = train_mlp(train_points, y_train, m, epochs=400, lr=0.01)  # Уменьшаем эпохи для скорости
+                mlp_l2, mlp_uni, mlp_large_err, _, _ = enhanced_evaluate_model(
+                    mlp_model, test_grid_points, y_test_grid, test_grid_points, y_test_grid, 
+                    is_mlp=True, tau_values=tau_values
+                )
+                
+                all_mlp_results[m]['l2'].append(mlp_l2)
+                all_mlp_results[m]['uniform'].append(mlp_uni)
+                all_mlp_results[m]['large_error_005'].append(mlp_large_err[0.05])
+                all_mlp_results[m]['large_error_01'].append(mlp_large_err[0.1])
+                
+                print(f"Ridge - L2: {ridge_l2:.4f}, Uniform: {ridge_uni:.4f}")
+                print(f"MLP   - L2: {mlp_l2:.4f}, Uniform: {mlp_uni:.4f}")
+        
+        # Усредняем результаты по сидам
+        results[func_name] = {
+            'm_values': m_values,
+            'ridge_l2_mean': [np.mean(all_ridge_results[m]['l2']) for m in m_values],
+            'ridge_l2_std': [np.std(all_ridge_results[m]['l2']) for m in m_values],
+            'ridge_uni_mean': [np.mean(all_ridge_results[m]['uniform']) for m in m_values],
+            'ridge_uni_std': [np.std(all_ridge_results[m]['uniform']) for m in m_values],
+            'ridge_large_005_mean': [np.mean(all_ridge_results[m]['large_error_005']) for m in m_values],
+            'ridge_large_005_std': [np.std(all_ridge_results[m]['large_error_005']) for m in m_values],
+            'ridge_large_01_mean': [np.mean(all_ridge_results[m]['large_error_01']) for m in m_values],
+            'ridge_large_01_std': [np.std(all_ridge_results[m]['large_error_01']) for m in m_values],
+            'mlp_l2_mean': [np.mean(all_mlp_results[m]['l2']) for m in m_values],
+            'mlp_l2_std': [np.std(all_mlp_results[m]['l2']) for m in m_values],
+            'mlp_uni_mean': [np.mean(all_mlp_results[m]['uniform']) for m in m_values],
+            'mlp_uni_std': [np.std(all_mlp_results[m]['uniform']) for m in m_values],
+            'mlp_large_005_mean': [np.mean(all_mlp_results[m]['large_error_005']) for m in m_values],
+            'mlp_large_005_std': [np.std(all_mlp_results[m]['large_error_005']) for m in m_values],
+            'mlp_large_01_mean': [np.mean(all_mlp_results[m]['large_error_01']) for m in m_values],
+            'mlp_large_01_std': [np.std(all_mlp_results[m]['large_error_01']) for m in m_values]
+        }
+        
+        # Визуализация результатов
+        plot_enhanced_results(results[func_name], func_name, tau_values)
+    
+    return results
+
+def plot_enhanced_results(result, func_name, tau_values):
+    m_values = result['m_values']
+    
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle(f'{func_name} - Uniform Training (4096 points) + 256x256 Test Grid', fontsize=14)
+    
+    # L2 errors
+    ax1.errorbar(m_values, result['ridge_l2_mean'], yerr=result['ridge_l2_std'], 
+                 fmt='o-', label='Ridge', capsize=5, linewidth=2, markersize=6)
+    ax1.errorbar(m_values, result['mlp_l2_mean'], yerr=result['mlp_l2_std'], 
+                 fmt='s-', label='MLP', capsize=5, linewidth=2, markersize=6)
+    ax1.set_xlabel('Number of components (m)')
+    ax1.set_ylabel('L2 Error')
+    ax1.set_title('L2 Error on 256x256 Test Grid')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    ax1.set_yscale('log')
+    
+    # Uniform errors
+    ax2.errorbar(m_values, result['ridge_uni_mean'], yerr=result['ridge_uni_std'], 
+                 fmt='o-', label='Ridge', capsize=5, linewidth=2, markersize=6)
+    ax2.errorbar(m_values, result['mlp_uni_mean'], yerr=result['mlp_uni_std'], 
+                 fmt='s-', label='MLP', capsize=5, linewidth=2, markersize=6)
+    ax2.set_xlabel('Number of components (m)')
+    ax2.set_ylabel('Uniform Error')
+    ax2.set_title('Uniform Error on 256x256 Test Grid')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    ax2.set_yscale('log')
+    
+    # Large error fractions for tau=0.05
+    ax3.errorbar(m_values, result['ridge_large_005_mean'], yerr=result['ridge_large_005_std'], 
+                 fmt='o-', label='Ridge τ=0.05', capsize=5, linewidth=2, markersize=6)
+    ax3.errorbar(m_values, result['mlp_large_005_mean'], yerr=result['mlp_large_005_std'], 
+                 fmt='s-', label='MLP τ=0.05', capsize=5, linewidth=2, markersize=6)
+    ax3.set_xlabel('Number of components (m)')
+    ax3.set_ylabel('Fraction of points')
+    ax3.set_title('Fraction of test points with error > 0.05')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+    
+    # Large error fractions for tau=0.1
+    ax4.errorbar(m_values, result['ridge_large_01_mean'], yerr=result['ridge_large_01_std'], 
+                 fmt='o-', label='Ridge τ=0.1', capsize=5, linewidth=2, markersize=6)
+    ax4.errorbar(m_values, result['mlp_large_01_mean'], yerr=result['mlp_large_01_std'], 
+                 fmt='s-', label='MLP τ=0.1', capsize=5, linewidth=2, markersize=6)
+    ax4.set_xlabel('Number of components (m)')
+    ax4.set_ylabel('Fraction of points')
+    ax4.set_title('Fraction of test points with error > 0.1')
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+# Run the uniform experiment
+print("🚀 Starting enhanced experiment with UNIFORM training data (4096 points) and 256x256 test grid")
+tau_values = [0.05, 0.1]
+results = run_uniform_experiment(n_seeds=3, tau_values=tau_values)
+
+# Enhanced summary table
+print("\n" + "="*100)
+print("ENHANCED SUMMARY: Uniform Training (4096) + 256x256 Test Grid (mean ± std over 3 seeds)")
+print("="*100)
+
+for func_name in results.keys():
+    print(f"\n{func_name}:")
+    header = "m\tRidge L2\t\tMLP L2\t\tRidge Uni\t\tMLP Uni"
+    print(header)
+    print("-" * 80)
+    
+    for i, m in enumerate(results[func_name]['m_values']):
+        ridge_l2 = f"{results[func_name]['ridge_l2_mean'][i]:.4f} ± {results[func_name]['ridge_l2_std'][i]:.4f}"
+        mlp_l2 = f"{results[func_name]['mlp_l2_mean'][i]:.4f} ± {results[func_name]['mlp_l2_std'][i]:.4f}"
+        ridge_uni = f"{results[func_name]['ridge_uni_mean'][i]:.4f} ± {results[func_name]['ridge_uni_std'][i]:.4f}"
+        mlp_uni = f"{results[func_name]['mlp_uni_mean'][i]:.4f} ± {results[func_name]['mlp_uni_std'][i]:.4f}"
+        
+        print(f"{m}\t{ridge_l2}\t{mlp_l2}\t{ridge_uni}\t{mlp_uni}")
+
+# Visualize sample training and test data
+def visualize_data_distribution():
+    """Визуализация распределения обучающих и тестовых данных"""
+    train_points = generate_uniform_training_data(4096)
+    test_points, X_grid, Y_grid = create_test_grid_256x256()
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # Обучающая выборка
+    ax1.scatter(train_points[:, 0], train_points[:, 1], alpha=0.6, s=1)
+    ax1.set_title(f'Uniform Training Data (N={len(train_points)} points)')
+    ax1.set_xlabel('x')
+    ax1.set_ylabel('y')
+    ax1.set_aspect('equal')
+    ax1.grid(True, alpha=0.3)
+    
+    # Тестовая сетка
+    ax2.scatter(test_points[::10, 0], test_points[::10, 1], alpha=0.6, s=1)  # Каждая 10-я точка для наглядности
+    ax2.set_title(f'Test Grid (256×256 = {len(test_points)} points)')
+    ax2.set_xlabel('x')
+    ax2.set_ylabel('y')
+    ax2.set_aspect('equal')
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+# Показываем распределение данных
+print("\n📊 Visualizing data distribution...")
+visualize_data_distribution()
+
